@@ -7,13 +7,13 @@ class SummarizerUnavailableError(Exception):
     """Raised when summarizer service cannot be used."""
 
 
-SILICONFLOW_ENDPOINT = "https://api.siliconflow.cn/v1/chat/completions"
-MODEL_FALLBACK_CHAIN = ["Qwen/Qwen3-8B", "THUDM/glm-4-9b-chat"]
+SILICONFLOW_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+MODEL_FALLBACK_CHAIN = [ "qwen/qwen3-8b","thudm/glm-4-9b",]
 
 SYSTEM_PROMPT = (
-    "你是一个对话摘要助手。请将用户提供的一轮对话（一问一答）压缩成1~3句话的简洁摘要。\n"
-    "要求：保留关键信息（话题、结论、重要细节），去除废话，语言简洁，使用与对话相同的语言。\n\n"
-    "只输出摘要本身，不要有任何前缀或解释。"
+    "You are a conversation summarization assistant. Please compress one round of dialogue provided by the user, one question and one answer, into a concise summary of 1 to 3 sentences.\n"
+    "Requirements: Preserve the key information, including the topic, conclusion, and important details. Remove unnecessary content, keep the language concise, and use the same language as the dialogue\n\n"
+    "Only output the summary itself, without any prefix or explanation"
 )
 
 

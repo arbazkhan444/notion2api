@@ -96,14 +96,33 @@ class NotionOpusAPI:
                     return thread_type
         return "workflow"
 
-    def _resolve_request_profile(self, thread_type: str) -> dict[str, Any]:
+    def _resolve_request_profile(
+        self,
+        thread_type: str,
+        *,
+        agent_mode: bool = False,
+    ) -> dict[str, Any]:
         is_markdown_chat = thread_type == "markdown-chat"
+        if agent_mode:
+            return {
+                "thread_type": thread_type,
+                "create_thread": False,
+                "is_partial_transcript": False,
+                "precreate_thread": False,
+                "include_debug_overrides": False,
+                "generate_title": False,
+                "save_all_thread_operations": False,
+                "set_unread_state": False,
+            }
         return {
             "thread_type": thread_type,
             "create_thread": not is_markdown_chat,
             "is_partial_transcript": is_markdown_chat,
             "precreate_thread": is_markdown_chat,
             "include_debug_overrides": True,
+            "generate_title": True,
+            "save_all_thread_operations": True,
+            "set_unread_state": True,
         }
 
     def _build_thread_headers(self) -> dict[str, str]:
@@ -225,7 +244,13 @@ class NotionOpusAPI:
                 extra={"request_info": {"event": "thread_delete_error", "thread_id": thread_id}},
             )
 
-    def stream_response(self, transcript: list, thread_id: Optional[str] = None) -> Generator[dict[str, Any], None, None]:
+    def stream_response(
+        self,
+        transcript: list,
+        thread_id: Optional[str] = None,
+        *,
+        agent_mode: bool = False,
+    ) -> Generator[dict[str, Any], None, None]:
         """
         发起 Notion API 请求并返回结构化流生成器。
         接收完整的 transcript 列表作为参数。
@@ -239,7 +264,10 @@ class NotionOpusAPI:
 
         notion_transcript = self._to_notion_transcript(transcript)
         thread_type = self._resolve_thread_type(notion_transcript)
-        request_profile = self._resolve_request_profile(thread_type)
+        request_profile = self._resolve_request_profile(
+            thread_type,
+            agent_mode=agent_mode,
+        )
 
         # 如果没有提供 thread_id，创建新的；否则重用已有的
         should_create_thread = thread_id is None
@@ -249,6 +277,11 @@ class NotionOpusAPI:
 
         # 保存 thread_id 以便外部访问
         self.current_thread_id = thread_id
+
+        if agent_mode and should_create_thread:
+            request_profile["create_thread"] = True
+            request_profile["is_partial_transcript"] = False
+            request_profile["precreate_thread"] = False
 
         if request_profile["precreate_thread"] and should_create_thread:
             if not self._create_thread(thread_id, thread_type):
@@ -284,9 +317,9 @@ class NotionOpusAPI:
             "threadId": thread_id,
             "threadType": thread_type,
             "createThread": request_profile["create_thread"],
-            "generateTitle": True,
-            "saveAllThreadOperations": True,
-            "setUnreadState": True,
+            "generateTitle": request_profile.get("generate_title", True),
+            "saveAllThreadOperations": request_profile.get("save_all_thread_operations", True),
+            "setUnreadState": request_profile.get("set_unread_state", True),
             "isPartialTranscript": request_profile["is_partial_transcript"],
             "asPatchResponse": True,
             "isUserInAnySalesAssistedSpace": False,
@@ -314,8 +347,12 @@ class NotionOpusAPI:
                     "trace_id": trace_id,
                     "thread_id": thread_id,
                     "thread_type": thread_type,
+                    "agent_mode": agent_mode,
                     "create_thread": bool(request_profile["create_thread"]),
                     "is_partial_transcript": bool(request_profile["is_partial_transcript"]),
+                    "generate_title": request_profile.get("generate_title"),
+                    "save_all_thread_operations": request_profile.get("save_all_thread_operations"),
+                    "set_unread_state": request_profile.get("set_unread_state"),
                     "account": self.account_key,
                     "space_id": self.space_id,
                 }

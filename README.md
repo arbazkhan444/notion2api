@@ -17,6 +17,7 @@ Notion2API 对 Notion AI 网页接口进行逆向工程，将其封装为标准�
 - **14 个 AI 模型** — Claude Sonnet/Opus、GPT-5.x、Gemini、Kimi、Grok、DeepSeek
 - **Thinking 面板** — 所有模型均支持推理过程展示
 - **Search 面板** — 展示 Web 搜索查询和来源链接
+- **编码 Agent 兼容** — 接收 OpenAI `tools` / `tool_calls` / `role:"tool"` 消息，并把 Notion 文本输出转换为 OpenAI 工具调用响应
 - **多账号池** — Round-Robin 负载均衡，带冷却故障转移
 - **内置 Web UI** — 极简设计，环境粒子动画，深色模式
 - **Docker 一键部署**
@@ -36,6 +37,21 @@ Notion2API 对 Notion AI 网页接口进行逆向工程，将其封装为标准�
 
 > **推荐**：`standard` — 完整上下文，无需数据库。  
 > 修改 `.env` 中的 `APP_MODE` 即可切换。
+
+### 编码 Agent / 工具调用
+
+`/v1/chat/completions` 现在会自动识别带 `tools`、assistant `tool_calls` 或 `role:"tool"` 的请求，并走无状态 Agent 适配路径。该路径会保留 OpenAI 工具循环的消息顺序，返回 `finish_reason: "tool_calls"` 和 OpenAI 兼容的 `message.tool_calls` / streaming `delta.tool_calls`。
+
+建议客户端配置：
+
+```txt
+Provider: OpenAI Compatible
+Base URL: http://localhost:8000/v1
+API Key: 任意非空字符串（如果服务端未强制校验）
+Model ID: claude-sonnet4.6
+```
+
+也支持常见别名，例如 `gpt-4o`、`gpt-4.1`、`claude-sonnet-4`，会映射到 `claude-sonnet4.6`。
 
 ---
 

@@ -10,13 +10,32 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.config import is_lite_mode
+from app.cline_tool_router import (
+    build_single_tool_call,
+    build_direct_tool_call_response,
+    direct_tool_response_payload,
+    direct_tool_stream,
+    find_tool_name,
+    has_tool_result,
+)
+from app.agent_adapter import (
+    apply_stop_sequences,
+    build_agent_transcript,
+    build_text_json_response,
+    build_tool_call_json_response,
+    content_to_text,
+    is_agent_request,
+    parse_tool_calls,
+    stream_text_response,
+    stream_tool_call_response,
+)
 from app.conversation import (
     build_lite_transcript,
     compress_round_if_needed,
     compress_sliding_window_round,
 )
 from app.logger import logger
-from app.model_registry import is_supported_model, list_available_models
+from app.model_registry import is_supported_model, list_available_models, normalize_model_name
 from app.notion_client import NotionUpstreamError
 from app.schemas import (
     ChatCompletionRequest,
@@ -443,11 +462,12 @@ def _prepare_messages(
     dialogue_messages = []
 
     for msg in req_body.messages:
+        msg_content = content_to_text(msg.content)
         if msg.role == "system":
-            if msg.content.strip():
-                system_messages.append(msg.content.strip())
+            if msg_content.strip():
+                system_messages.append(msg_content.strip())
             continue
-        dialogue_messages.append((msg.role, msg.content, msg.thinking or ""))
+        dialogue_messages.append((msg.role, msg_content, msg.thinking or ""))
 
     if not dialogue_messages:
         raise HTTPException(
@@ -481,10 +501,11 @@ def _prepare_messages_lite(req_body: ChatCompletionRequest) -> str:
     user_prompt = ""
 
     for msg in req_body.messages:
-        if msg.role == "system" and msg.content.strip():
-            system_messages.append(msg.content.strip())
+        msg_content = content_to_text(msg.content)
+        if msg.role == "system" and msg_content.strip():
+            system_messages.append(msg_content.strip())
         elif msg.role == "user":
-            user_prompt = msg.content
+            user_prompt = msg_content
 
     if not user_prompt.strip():
         raise HTTPException(
@@ -866,6 +887,451 @@ def _is_client_disconnect_error(exc: BaseException) -> bool:
     if isinstance(exc, OSError):
         return exc.errno in {32, 54, 104, 10053, 10054}
     return False
+
+
+def _collect_notion_text(
+    first_item: Any,
+    stream_gen: Iterable[Any],
+) -> tuple[str, str]:
+    content_parts: list[str] = []
+    thinking_parts: list[str] = []
+    authoritative_final_content = ""
+    authoritative_final_source_type = ""
+
+    for raw_item in _iter_stream_items(first_item, stream_gen):
+        item = _normalize_stream_item(raw_item)
+        item_type = item.get("type")
+
+        if item_type == "final_content":
+            final_text = str(item.get("text", "") or "").strip()
+            if final_text:
+                authoritative_final_content = final_text
+                authoritative_final_source_type = str(item.get("source_type", "") or "")
+            continue
+        if item_type == "thinking":
+            thinking_text = str(item.get("text", "") or "")
+            if thinking_text:
+                thinking_parts.append(thinking_text)
+            continue
+        if item_type != "content":
+            continue
+
+        chunk_text = str(item.get("text", "") or "")
+        if chunk_text:
+            content_parts.append(chunk_text)
+
+    full_text, _ = _select_best_final_reply(
+        "".join(content_parts),
+        authoritative_final_content,
+        authoritative_final_source_type,
+    )
+    return full_text, "".join(thinking_parts).strip()
+
+
+def _message_role(msg: Any) -> str:
+    if isinstance(msg, dict):
+        return str(msg.get("role") or "")
+    return str(getattr(msg, "role", "") or "")
+
+
+def _message_content(msg: Any) -> Any:
+    if isinstance(msg, dict):
+        return msg.get("content")
+    return getattr(msg, "content", None)
+
+
+def _message_name(msg: Any) -> str:
+    if isinstance(msg, dict):
+        return str(msg.get("name") or "")
+    return str(getattr(msg, "name", "") or "")
+
+
+def _extract_tool_result_excerpt(
+    messages: list[Any],
+    max_chars: int = 8000,
+) -> str:
+    parts: list[str] = []
+
+    for msg in messages:
+        if _message_role(msg) not in {"tool", "function"}:
+            continue
+
+        text = content_to_text(_message_content(msg))
+        if text.strip():
+            label = f"Tool result from {_message_name(msg) or 'tool'}:"
+            parts.append(f"{label}\n{text}")
+
+    blob = "\n\n".join(parts).strip()
+    if len(blob) > max_chars:
+        blob = blob[:max_chars] + "\n\n[Tool result truncated.]"
+
+    return blob
+
+
+def _build_notion_failed_completion_text(
+    messages: list[Any],
+    exc: NotionUpstreamError,
+) -> str:
+    tool_result = _extract_tool_result_excerpt(messages)
+    status_code = getattr(exc, "status_code", None) or "unknown"
+
+    if not tool_result:
+        return (
+            "The upstream Notion request failed before I could complete the task. "
+            f"Error: HTTP {status_code}."
+        )
+
+    return (
+        "The requested tool was executed successfully, but the Notion upstream "
+        f"failed while interpreting the result. Error: HTTP {status_code}.\n\n"
+        "Here is the tool result I received:\n\n"
+        f"{tool_result}"
+    )
+
+
+async def _handle_agent_request(
+    request: Request,
+    req_body: ChatCompletionRequest,
+    response: Response,
+) -> JSONResponse | StreamingResponse | dict[str, Any]:
+    """Stateless OpenAI tool/function-call compatibility path for coding agents."""
+    pool = request.app.state.account_pool
+    model_name = normalize_model_name(req_body.model)
+
+    if not is_supported_model(model_name):
+        available_models = list_available_models()
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported model '{req_body.model}'. Available models: {', '.join(available_models)}",
+        )
+
+    direct = build_direct_tool_call_response(req_body, model_name)
+    if direct:
+        response_id, tool_call = direct
+        logger.info(
+            "Direct Cline tool call selected",
+            extra={
+                "request_info": {
+                    "event": "direct_cline_tool_call",
+                    "model": model_name,
+                    "tool_name": tool_call["function"]["name"],
+                    "arguments": tool_call["function"]["arguments"],
+                }
+            },
+        )
+        if req_body.stream:
+            return StreamingResponse(
+                direct_tool_stream(response_id, model_name, tool_call),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        return direct_tool_response_payload(response_id, model_name, tool_call)
+
+    response_id = f"chatcmpl-{uuid.uuid4().hex}"
+    max_retries = max(3, len(pool.clients))
+
+    for attempt in range(1, max_retries + 1):
+        client = None
+        try:
+            client = pool.get_client()
+            account = {
+                "user_id": getattr(client, "user_id", ""),
+                "space_id": getattr(client, "space_id", ""),
+            }
+            transcript = build_agent_transcript(
+                messages=req_body.messages,
+                model_name=model_name,
+                account=account,
+                tools=req_body.tools,
+                tool_choice=req_body.tool_choice,
+                response_format=req_body.response_format,
+                max_tokens=req_body.max_tokens,
+                max_completion_tokens=req_body.max_completion_tokens,
+            )
+            logger.info(
+                "Agent transcript built",
+                extra={
+                    "request_info": {
+                        "event": "agent_transcript_built",
+                        "blocks": len(transcript),
+                        "block_types": [block.get("type") for block in transcript],
+                        "user_excerpt": str(
+                            (transcript[-1].get("value", [[""]]) or [[""]])[0][0]
+                        )[:1000],
+                    }
+                },
+            )
+
+            stream_gen = client.stream_response(
+                transcript,
+                thread_id=None,
+                agent_mode=True,
+            )
+            first_item = next(stream_gen, None)
+            if first_item is None:
+                raise NotionUpstreamError(
+                    "Notion upstream returned empty content.", retriable=True
+                )
+
+            full_text, _thinking = _collect_notion_text(first_item, stream_gen)
+            if not full_text.strip():
+                raise NotionUpstreamError(
+                    "Notion upstream returned empty content.", retriable=True
+                )
+            if full_text.strip().startswith("[Assistant requested tool calls]"):
+                logger.warning(
+                    "Agent upstream returned previous tool-call metadata",
+                    extra={
+                        "request_info": {
+                            "event": "agent_returned_tool_metadata_echo",
+                            "text_excerpt": full_text[:500],
+                        }
+                    },
+                )
+                full_text = (
+                    "I received the tool result, but the upstream response echoed prior "
+                    "tool-call metadata instead of answering. Please retry after the "
+                    "transcript filtering fix is applied."
+                )
+
+            allowed_tool_names = {
+                str((tool.get("function") or {}).get("name") or "")
+                for tool in req_body.tools or []
+                if isinstance(tool, dict)
+            }
+            allowed_tool_names.discard("")
+            tool_calls: list[dict[str, Any]] = []
+            if req_body.tools and req_body.tool_choice != "none":
+                try:
+                    tool_calls = parse_tool_calls(
+                        full_text,
+                        allowed_tool_names,
+                        parallel_tool_calls=req_body.parallel_tool_calls,
+                    )
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    logger.warning(
+                        "Agent tool-call parser failed; returning upstream text",
+                        exc_info=True,
+                        extra={
+                            "request_info": {
+                                "event": "agent_tool_parse_failed",
+                                "attempt": attempt,
+                            }
+                        },
+                    )
+
+            logger.info(
+                "Agent upstream response collected",
+                extra={
+                    "request_info": {
+                        "event": "agent_upstream_response",
+                        "text_excerpt": full_text[:500],
+                        "tools_count": len(req_body.tools or []),
+                        "parsed_tool_calls": len(tool_calls),
+                    }
+                },
+            )
+
+            completion_tool = find_tool_name(
+                list(req_body.tools or []),
+                ["attempt_completion"],
+            )
+            if (
+                has_tool_result(list(req_body.messages or []))
+                and completion_tool
+                and not tool_calls
+            ):
+                completion_call = build_single_tool_call(
+                    completion_tool,
+                    {"result": full_text},
+                )
+                logger.info(
+                    "Wrapping final answer as Cline completion tool",
+                    extra={
+                        "request_info": {
+                            "event": "cline_attempt_completion_selected",
+                            "tool_name": completion_tool,
+                            "result_excerpt": full_text[:500],
+                        }
+                    },
+                )
+                if req_body.stream:
+                    return StreamingResponse(
+                        stream_tool_call_response(
+                            response_id,
+                            model_name,
+                            [completion_call],
+                        ),
+                        media_type="text/event-stream",
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                            "X-Accel-Buffering": "no",
+                        },
+                    )
+                return build_tool_call_json_response(
+                    response_id,
+                    model_name,
+                    [completion_call],
+                )
+
+            if tool_calls:
+                if req_body.stream:
+                    return StreamingResponse(
+                        stream_tool_call_response(response_id, model_name, tool_calls),
+                        media_type="text/event-stream",
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                            "X-Accel-Buffering": "no",
+                        },
+                    )
+                return build_tool_call_json_response(response_id, model_name, tool_calls)
+
+            if full_text.strip().lower() in {"understood", "understood."}:
+                logger.warning(
+                    "Agent response was only acknowledgement",
+                    extra={
+                        "request_info": {
+                            "event": "agent_ack_only_response",
+                            "model": model_name,
+                            "tools_count": len(req_body.tools or []),
+                        }
+                    },
+                )
+                full_text = (
+                    "I was unable to produce a useful agent response. "
+                    "The upstream model returned only an acknowledgement instead of "
+                    "answering or calling a tool."
+                )
+
+            full_text = apply_stop_sequences(full_text, req_body.stop)
+            if req_body.stream:
+                return StreamingResponse(
+                    stream_text_response(response_id, model_name, full_text),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+            return build_text_json_response(response_id, model_name, full_text)
+
+        except NotionUpstreamError as exc:
+            if client is not None and exc.retriable:
+                pool.mark_failed(client)
+            logger.warning(
+                "Agent mode: Notion upstream failed",
+                extra={
+                    "request_info": {
+                        "event": "agent_notion_upstream_failed",
+                        "attempt": attempt,
+                        "max_retries": max_retries,
+                        "status_code": exc.status_code,
+                        "retriable": exc.retriable,
+                        "response_excerpt": exc.response_excerpt,
+                    }
+                },
+            )
+            messages_list = list(req_body.messages or [])
+            completion_tool = find_tool_name(
+                list(req_body.tools or []),
+                ["attempt_completion"],
+            )
+            if has_tool_result(messages_list) and completion_tool:
+                fallback_text = _build_notion_failed_completion_text(
+                    messages_list,
+                    exc,
+                )
+                completion_call = build_single_tool_call(
+                    completion_tool,
+                    {"result": fallback_text},
+                )
+                logger.warning(
+                    "Wrapping Notion upstream failure as Cline completion",
+                    extra={
+                        "request_info": {
+                            "event": "cline_attempt_completion_after_notion_failure",
+                            "status_code": getattr(exc, "status_code", None),
+                            "tool_name": completion_tool,
+                            "result_excerpt": fallback_text[:500],
+                        }
+                    },
+                )
+                if req_body.stream:
+                    return StreamingResponse(
+                        stream_tool_call_response(
+                            response_id,
+                            model_name,
+                            [completion_call],
+                        ),
+                        media_type="text/event-stream",
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                            "X-Accel-Buffering": "no",
+                        },
+                    )
+                return build_tool_call_json_response(
+                    response_id,
+                    model_name,
+                    [completion_call],
+                )
+            if attempt == max_retries or not exc.retriable:
+                return _upstream_error_response(exc)
+        except RuntimeError as exc:
+            logger.error(
+                "Agent mode: No available client in account pool",
+                extra={
+                    "request_info": {
+                        "event": "agent_account_pool_unavailable",
+                        "detail": str(exc),
+                    }
+                },
+            )
+            return _build_error_response(
+                503,
+                code="POOL_COOLING",
+                message=str(exc),
+                error_type="account_pool_cooling",
+                suggestion="所有账号暂时冷却中，请等待几秒后重试",
+            )
+        except HTTPException:
+            raise
+        except Exception:
+            if client is not None:
+                pool.mark_failed(client)
+            logger.error(
+                "Agent mode: Unhandled error",
+                exc_info=True,
+                extra={
+                    "request_info": {
+                        "event": "agent_unhandled_exception",
+                        "attempt": attempt,
+                    }
+                },
+            )
+            if attempt == max_retries:
+                return _build_error_response(
+                    500,
+                    code="INTERNAL_ERROR",
+                    message="服务内部异常",
+                    error_type="internal_error",
+                    suggestion="请稍后重试，如持续出现请联系管理员",
+                )
+
+    return _build_error_response(
+        503,
+        code="RETRIES_EXHAUSTED",
+        message="所有重试均已失败",
+        error_type="upstream_error",
+        suggestion="Notion 上游服务暂时不可用，请稍后重试",
+    )
 
 
 async def _handle_lite_request(
@@ -1288,6 +1754,47 @@ async def create_chat_completion(
     - Heavy 模式：20/分钟（包含会话管理）
     """
     from app.config import is_standard_mode
+
+    req_body.model = normalize_model_name(req_body.model)
+
+    logger.info(
+        "Chat payload received",
+        extra={
+            "request_info": {
+                "event": "chat_payload_received",
+                "model": req_body.model,
+                "stream": req_body.stream,
+                "tools_count": len(req_body.tools or []),
+                "tool_choice": str(req_body.tool_choice),
+                "roles": [getattr(m, "role", "") for m in req_body.messages[:10]],
+                "messages_count": len(req_body.messages or []),
+                "first_system_excerpt": next(
+                    (
+                        content_to_text(getattr(m, "content", None))[:500]
+                        for m in req_body.messages
+                        if getattr(m, "role", "") == "system"
+                    ),
+                    "",
+                ),
+            }
+        },
+    )
+
+    # Agent/tool requests must bypass Lite/Standard/Heavy memory paths because
+    # OpenAI-compatible clients send the full tool loop in each request.
+    if is_agent_request(req_body):
+        logger.info(
+            "Routing request through agent adapter",
+            extra={
+                "request_info": {
+                    "event": "agent_adapter_selected",
+                    "model": req_body.model,
+                    "tools_count": len(req_body.tools or []),
+                    "messages_count": len(req_body.messages or []),
+                }
+            },
+        )
+        return await _handle_agent_request(request, req_body, response)
 
     # Lite 模式：单轮问答，无记忆
     if is_lite_mode():

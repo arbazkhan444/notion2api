@@ -4,6 +4,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.exceptions import RequestValidationError
 from slowapi.errors import RateLimitExceeded
 from contextlib import asynccontextmanager
 from app.config import ACCOUNTS, API_KEY, ALLOWED_ORIGINS, is_lite_mode, is_standard_mode
@@ -62,6 +63,34 @@ def custom_rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded)
         content={"error": "Too many requests, please try again later"}
     )
 app.add_exception_handler(RateLimitExceeded, custom_rate_limit_exceeded_handler)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    body = await request.body()
+    logger.error(
+        "Request validation failed",
+        extra={
+            "request_info": {
+                "event": "request_validation_failed",
+                "method": request.method,
+                "path": request.url.path,
+                "errors": exc.errors(),
+                "body_excerpt": body[:4000].decode("utf-8", errors="replace"),
+            }
+        },
+    )
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": {
+                "message": "Request validation failed",
+                "type": "invalid_request_error",
+                "code": "REQUEST_VALIDATION_FAILED",
+                "details": exc.errors(),
+            }
+        },
+    )
 
 
 @app.exception_handler(Exception)

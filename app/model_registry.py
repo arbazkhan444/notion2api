@@ -17,6 +17,18 @@ MODEL_MAP: dict[str, str] = {
 
 NOTION_MODEL_REVERSE_MAP: dict[str, str] = {value: key for key, value in MODEL_MAP.items()}
 
+MODEL_ALIASES: dict[str, str] = {
+    "gpt-5": "claude-sonnet4.6",
+    "gpt-5-codex": "claude-sonnet4.6",
+    "gpt-4o": "claude-sonnet4.6",
+    "gpt-4.1": "claude-sonnet4.6",
+    "gpt-4": "claude-sonnet4.6",
+    "gpt-4-turbo": "claude-sonnet4.6",
+    "claude-sonnet-4": "claude-sonnet4.6",
+    "claude-sonnet-4-6": "claude-sonnet4.6",
+    "notion/claude-sonnet4.6": "claude-sonnet4.6",
+}
+
 DISPLAY_NAMES: dict[str, str] = {
     "claude-opus4.6": "Claude Opus 4.6",
     "claude-opus4.7": "Claude Opus 4.7",
@@ -55,8 +67,15 @@ MODEL_ICONS: dict[str, str] = {
 DEFAULT_MODEL = "claude-sonnet4.6"
 
 
+def normalize_model_name(model_name: str) -> str:
+    if model_name in MODEL_MAP:
+        return model_name
+    return MODEL_ALIASES.get(model_name, model_name)
+
+
 def get_notion_model(model_name: str) -> str:
-    return MODEL_MAP.get(model_name, MODEL_MAP[DEFAULT_MODEL])
+    standard_name = normalize_model_name(model_name)
+    return MODEL_MAP.get(standard_name, MODEL_MAP[DEFAULT_MODEL])
 
 
 # 需要走 markdown-chat 的 Notion 内部代号（vertex- 前缀的模型）
@@ -88,9 +107,10 @@ def get_thread_type(model_name: str) -> str:
 
 
 def get_standard_model(model_name: str) -> str:
-    if model_name in MODEL_MAP:
-        return model_name
-    return NOTION_MODEL_REVERSE_MAP.get(model_name, DEFAULT_MODEL)
+    normalized = normalize_model_name(model_name)
+    if normalized in MODEL_MAP:
+        return normalized
+    return NOTION_MODEL_REVERSE_MAP.get(normalized, DEFAULT_MODEL)
 
 
 def list_available_models() -> list[str]:
@@ -98,7 +118,7 @@ def list_available_models() -> list[str]:
 
 
 def is_supported_model(model_name: str) -> bool:
-    return model_name in MODEL_MAP
+    return normalize_model_name(model_name) in MODEL_MAP
 
 
 def get_display_name(model_name: str) -> str:

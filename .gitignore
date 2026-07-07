@@ -68,3 +68,4 @@ docker-compose.override.yml
 
 # Response debug data (contains sensitive tokens)
 response/
+/.omx

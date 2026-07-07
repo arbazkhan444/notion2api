@@ -1943,6 +1943,26 @@ def build_lite_transcript(user_prompt: str, model_name: str) -> list[dict[str, A
     ]
 
 
+def _openai_content_to_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text":
+                parts.append(str(item.get("text", "")))
+            elif "text" in item:
+                parts.append(str(item.get("text", "")))
+            elif item.get("type") == "image_url":
+                parts.append("[Image input omitted: image_url content is not supported by this proxy yet]")
+        return "\n".join(part for part in parts if part.strip())
+    return str(content)
+
+
 def build_standard_transcript(
     messages: list[dict[str, Any]],
     model_name: str,
@@ -1997,7 +2017,7 @@ def build_standard_transcript(
 
     for msg in messages:
         role = msg.get("role")
-        content = msg.get("content", "")
+        content = _openai_content_to_text(msg.get("content", ""))
 
         if role == "system":
             system_instructions.append(content)

@@ -15,6 +15,7 @@ Notion2API reverse-engineers the Notion AI web interface and exposes it as a sta
 - **13 AI Models** — Claude Sonnet/Opus, GPT-5.x, Gemini, Kimi, Grok, DeepSeek
 - **Thinking Panel** — Reasoning process display for all models
 - **Search Panel** — Web search queries and source links
+- **Coding Agent Compatibility** — Accepts OpenAI `tools` / `tool_calls` / `role:"tool"` messages and converts Notion text output into OpenAI tool-call responses
 - **Multi-Account Pool** — Round-Robin load balancing with cooldown failover
 - **Built-in Web UI** — Minimalist design, ambient animations, dark mode
 - **Docker Ready** — One-command deployment
@@ -34,6 +35,21 @@ Notion2API reverse-engineers the Notion AI web interface and exposes it as a sta
 
 > **Recommended**: `standard` — full context, no database required.  
 > Switch by setting `APP_MODE` in `.env`.
+
+### Coding Agents / Tool Calling
+
+`/v1/chat/completions` automatically detects requests with `tools`, assistant `tool_calls`, or `role:"tool"` messages and routes them through a stateless agent adapter. This preserves OpenAI tool-loop message order and returns `finish_reason: "tool_calls"` plus OpenAI-compatible `message.tool_calls` / streaming `delta.tool_calls`.
+
+Suggested client setup:
+
+```txt
+Provider: OpenAI Compatible
+Base URL: http://localhost:8000/v1
+API Key: any non-empty string if your server does not enforce one
+Model ID: claude-sonnet4.6
+```
+
+Common aliases such as `gpt-4o`, `gpt-4.1`, and `claude-sonnet-4` are accepted and mapped to `claude-sonnet4.6`.
 
 ---
 

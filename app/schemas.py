@@ -1,5 +1,5 @@
 import time
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 # ================================
@@ -7,10 +7,17 @@ from pydantic import BaseModel, Field
 # ================================
 
 class ChatMessage(BaseModel):
-    """单条对话消息"""
-    role: Literal["user", "assistant", "system"]
-    content: str
+    """单条对话消息：请求侧保持宽松，避免代理层过早 422。"""
+    role: str
+    content: Any = None
     thinking: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    function_call: Any = None
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
+
+    class Config:
+        extra = "allow"
 
 class ChatCompletionRequest(BaseModel):
     """
@@ -21,7 +28,18 @@ class ChatCompletionRequest(BaseModel):
     messages: List[ChatMessage]
     stream: bool = Field(default=False, description="Whether to stream the response as SSE.")
     temperature: Optional[float] = Field(default=None, description="Sampling temperature.")
+    top_p: Optional[float] = None
+    max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = None
+    stop: Any = None
+    tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Any = None
+    parallel_tool_calls: Optional[bool] = None
+    response_format: Any = None
     conversation_id: Optional[str] = Field(default=None, description="Extension for stateful conversation tracking.")
+
+    class Config:
+        extra = "allow"
 
 # ================================
 # 非流式返回 Schema
@@ -56,6 +74,7 @@ class ChatCompletionChunkDelta(BaseModel):
     """SSE Delta Block"""
     content: Optional[str] = None
     role: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
 
 class ChatCompletionChunkChoice(BaseModel):
     """SSE Choice Block"""
