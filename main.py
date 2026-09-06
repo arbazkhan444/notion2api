@@ -1,82 +1,65 @@
+"""Interactive client: store only finalized, successful turns."""
 import sys
-
-from app.config import get_default_account
-from app.conversation import ConversationManager
-from app.notion_client import NotionOpusAPI
 
 
 def main():
     try:
-        account = get_default_account()
-    except ValueError as e:
-        print(f"[配置错误] {e}")
-        sys.exit(1)
+        from app.config import get_default_account
+        from app.conversation import ConversationManager
+        from app.notion_client import NotionOpusAPI
+        client = NotionOpusAPI(get_default_account())
+        manager = ConversationManager()
+    except (ValueError, OSError) as exc:
+        print(f'[Configuration error] {type(exc).__name__}. Check your local configuration.')
+        return 1
 
-    client = NotionOpusAPI(account)
-    manager = ConversationManager()
-
-    print("=" * 40)
-    print("        Notion Opus 终端       ")
-    print(" 输入 'exit' 退出程序，输入 'new' 开始新对话。")
-    print("=" * 40)
-
+    print("Notion Opus terminal — 'exit' to quit, 'new' for a new conversation.")
     current_conv = manager.new_conversation()
-
     while True:
         try:
-            user_input = input("\n[You]: ").strip()
+            prompt = input('\n[You]: ').strip()
         except (KeyboardInterrupt, EOFError):
-            print("\n\n退出程序...")
             break
-
-        if not user_input:
+        if not prompt:
             continue
-
-        if user_input.lower() == "exit":
-            print("退出程序...")
+        if prompt.lower() == 'exit':
             break
-
-        if user_input.lower() == "new":
+        if prompt.lower() == 'new':
             current_conv = manager.new_conversation()
-            print("\n--- 已开启新对话 ---")
+            print('New conversation started.')
             continue
-
-        transcript = manager.get_transcript(client, current_conv, user_input, "claude-opus4.6")
-
-        print("\n[AI]: ", end="", flush=True)
-
-        full_text = ""
-        stream = client.stream_response(transcript)
-
+        stream = None
         try:
+            transcript = manager.get_transcript(client, current_conv, prompt, 'claude-opus4.6')
+            stream = client.stream_response(transcript)
+            answer = ''
+            thinking = ''
             for item in stream:
-                if isinstance(item, dict):
-                    item_type = item.get("type")
-                    if item_type == "content":
-                        text = str(item.get("text", "") or "")
-                        if text:
-                            print(text, end="", flush=True)
-                            full_text += text
-                    elif item_type == "search":
-                        search_data = item.get("data", {})
-                        if isinstance(search_data, dict) and search_data.get("queries"):
-                            print(f"\n[Search] {', '.join(search_data.get('queries', []))}\n", end="", flush=True)
-                    continue
-
-                if isinstance(item, str) and item:
-                    print(item, end="", flush=True)
-                    full_text += item
+                if isinstance(item, str):
+                    answer += item
+                elif isinstance(item, dict):
+                    if item.get('type') == 'content':
+                        answer += str(item.get('text') or '')
+                    elif item.get('type') == 'final_content':
+                        answer = str(item.get('text') or '')
+                    elif item.get('type') == 'thinking':
+                        thinking += str(item.get('text') or '')
+                    elif item.get('type') == 'error':
+                        raise RuntimeError('Upstream reported an error.')
+            if not answer and not thinking:
+                raise RuntimeError('No response received.')
+            # Printing final text avoids showing replacements as duplicate append-only output.
+            manager.persist_round(current_conv, prompt, answer, thinking)
+            print('\n[AI]: ' + (answer or '[No visible answer; reasoning only.]'))
         except KeyboardInterrupt:
-            print("\n[提示] 用户中断当前输出")
-        except Exception as e:
-            print(f"\n[错误]: 输出流解析异常 - {e}")
-
-        print()
-
-        if full_text:
-            manager.add_message(current_conv, "user", user_input)
-            manager.add_message(current_conv, "assistant", full_text)
+            print('\n[Interrupted] This turn was not saved.')
+        except Exception as exc:
+            print(f'\n[Error] {type(exc).__name__}. This turn was not saved.')
+        finally:
+            if stream is not None:
+                stream.close()
+    return 0
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    sys.exit(main())

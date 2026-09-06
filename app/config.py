@@ -1,66 +1,60 @@
-import os
 import json
+import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-# 加载 .env 文件中的环境变量（override=True 确保 .env 优先于系统环境变量）
-load_dotenv(override=True)
+# Deployment environment takes precedence over a local .env file.
+load_dotenv(override=False)
+REQUIRED_ACCOUNT_FIELDS = {'token_v2', 'space_id', 'user_id'}
 
-REQUIRED_ACCOUNT_FIELDS = {"token_v2", "space_id", "user_id"}
 
 def load_accounts():
-    """
-    从 accounts.json 文件或环境变量 NOTION_ACCOUNTS 加载账号配置。
-    优先级：accounts.json > NOTION_ACCOUNTS 环境变量
-    """
-    # 优先从 accounts.json 文件读取
-    accounts_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "accounts.json")
-    accounts_json = None
-
-    if os.path.exists(accounts_file):
-        with open(accounts_file, "r", encoding="utf-8") as f:
-            accounts_json = f.read().strip()
-    
-    # 回退到环境变量
-    if not accounts_json:
-        accounts_json = os.getenv("NOTION_ACCOUNTS")
-
-    if not accounts_json:
-        raise ValueError("未找到账号配置：请创建 accounts.json 文件或设置 NOTION_ACCOUNTS 环境变量。")
-    
+    text = os.getenv('NOTION_ACCOUNTS', '').strip()
+    if not text:
+        file = Path(__file__).resolve().parent.parent / 'accounts.json'
+        if file.is_file():
+            text = file.read_text(encoding='utf-8').strip()
+    if not text:
+        raise ValueError('Configure NOTION_ACCOUNTS or accounts.json with at least one account.')
     try:
-        accounts = json.loads(accounts_json)
-        if not isinstance(accounts, list) or len(accounts) == 0:
-            raise ValueError("账号配置格式不正确，应提供非空的 JSON 数组。")
-        for idx, account in enumerate(accounts):
-            if not isinstance(account, dict):
-                raise ValueError(f"账号配置[{idx}] 必须是对象。")
-            missing = sorted(field for field in REQUIRED_ACCOUNT_FIELDS if not account.get(field))
-            if missing:
-                raise ValueError(f"账号配置[{idx}] 缺少必要字段: {', '.join(missing)}")
-        return accounts
-    except json.JSONDecodeError as e:
-        raise ValueError(f"解析账号配置失败: {e}")
+        accounts = json.loads(text)
+    except json.JSONDecodeError:
+        raise ValueError('Account configuration must be valid JSON.') from None
+    if not isinstance(accounts, list) or not accounts:
+        raise ValueError('Account configuration must be a nonempty JSON array.')
+    for index, account in enumerate(accounts):
+        if not isinstance(account, dict):
+            raise ValueError(f'Account {index} must be an object.')
+        for field in REQUIRED_ACCOUNT_FIELDS:
+            value = account.get(field)
+            if not isinstance(value, str) or not value.strip() or '\r' in value or '\n' in value:
+                raise ValueError(f'Account {index} has an invalid {field}.')
+        cookies = account.get('cookies') or {}
+        if not isinstance(cookies, dict) or any(not isinstance(k, str) or not isinstance(v, str) or '\r' in k + v or '\n' in k + v for k, v in cookies.items()):
+            raise ValueError(f'Account {index} has invalid cookies.')
+    return accounts
 
-# 全局配置对象
+
 ACCOUNTS = load_accounts()
+API_KEY = os.getenv('API_KEY', '')
+SILICONFLOW_API_KEY = os.getenv('SILICONFLOW_API_KEY', '')
+HOST = os.getenv('HOST', '127.0.0.1')
+PORT = int(os.getenv('PORT', '8000'))
+if not 1 <= PORT <= 65535:
+    raise ValueError('PORT must be between 1 and 65535.')
+ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv('ALLOWED_ORIGINS', f'http://localhost:{PORT},http://127.0.0.1:{PORT}').split(',') if origin.strip()]
+APP_MODE = os.getenv('APP_MODE', 'heavy').lower().strip()
+if APP_MODE not in ('lite', 'standard', 'heavy'):
+    raise ValueError('APP_MODE must be lite, standard, or heavy.')
 
-# FastAPI 服务配置
-API_KEY = os.getenv("API_KEY", "")
-SILICONFLOW_API_KEY = os.getenv("SILICONFLOW_API_KEY", "")
-HOST = os.getenv("HOST", "0.0.0.0")
-PORT = int(os.getenv("PORT", "8000"))
-ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",") if origin.strip()]
 
-# APP_MODE: heavy（默认）、lite 或 standard
-APP_MODE = os.getenv("APP_MODE", "heavy").lower().strip()
+def is_lite_mode():
+    return APP_MODE == 'lite'
 
-def is_lite_mode() -> bool:
-    return APP_MODE == "lite"
 
-def is_standard_mode() -> bool:
-    """Standard 模式：发送完整上下文，支持 thinking 和搜索输出"""
-    return APP_MODE == "standard"
+def is_standard_mode():
+    return APP_MODE == 'standard'
+
 
 def get_default_account():
-    """获取默认账号（列表中的第一个账号）"""
     return ACCOUNTS[0]
