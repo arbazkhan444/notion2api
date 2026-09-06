@@ -1,16 +1,20 @@
-/* Shared by the served entrypoint; no dependency on third-party scripts. */
+/* Shared browser storage boundary; preserves unreadable original data. */
 (function (root) {
-  let warning = '';
-  function notice() {
-    warning = 'Browser storage is unavailable or full. Changes may not survive a reload.';
-    if (root.document && root.CustomEvent) {
-      root.dispatchEvent(new root.CustomEvent('notion-storage-warning'));
-    }
+  let warning = '', chatsReadFailed = false;
+  function notice(message) {
+    warning = message || 'Browser storage is unavailable or full. Changes may not survive a reload.';
+    if (root.document && root.CustomEvent) root.dispatchEvent(new root.CustomEvent('notion-storage-warning'));
   }
   function store(name) {
     return {
       getItem(key) { try { return root[name].getItem(key); } catch (_) { notice(); return null; } },
-      setItem(key, value) { try { root[name].setItem(key, value); return true; } catch (_) { notice(); return false; } },
+      setItem(key, value) {
+        if (name === 'localStorage' && key === 'claude_chats' && chatsReadFailed) {
+          notice('Saved chats could not be read. Export or repair browser storage before clearing it.');
+          return false;
+        }
+        try { root[name].setItem(key, value); return true; } catch (_) { notice(); return false; }
+      },
       removeItem(key) { try { root[name].removeItem(key); } catch (_) { notice(); } }
     };
   }
@@ -26,7 +30,8 @@
           .map(chat => ({...chat, title: typeof chat.title === 'string' ? chat.title : 'Untitled chat',
                         messages: Array.isArray(chat.messages) ? chat.messages : []}));
       } catch (_) {
-        warning = 'Saved chats could not be read. Export or repair browser storage before clearing it.';
+        chatsReadFailed = true;
+        notice('Saved chats could not be read. Export or repair browser storage before clearing it.');
         return [];
       }
     },
