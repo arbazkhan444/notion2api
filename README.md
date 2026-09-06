@@ -1,324 +1,131 @@
 # Notion2API
 
-> Notion AI → OpenAI 兼容 API
+> Notion AI → 有限的、仅文本 OpenAI 兼容 API
 
 🌐 [English](./README_EG.md) | 中文
 
-Notion2API 对 Notion AI 网页接口进行逆向工程，将其封装为标准的 `/v1/chat/completions` 端点，可直接用于 Cherry Studio、Zotero 以及任何兼容 OpenAI 的客户端。
+Notion2API 将 Notion AI 的私有网页接口适配为 `/v1/chat/completions`。上游协议和模型可用性可能变化；本项目并非完整 OpenAI API，也不是具有租户隔离能力的托管服务。
 
-2026.06.10: 由于我的notion是business试用，不能使用fable5模型，故无法更新，欢迎大家自己抓取模型名称后提交PR。（F12，Network-payload-runInferenceScript里面，最下侧请求展开获取model内部代号即可）
+> **代码审查修复分支：** 已提交代码和回归测试，但尚未执行测试或进行真实上游验证。部署前请阅读 [兼容性说明与验证清单](docs/API_COMPATIBILITY.md)，备份已有 SQLite 数据，并先在专用测试环境验证。
 
----
+## 功能与模式
 
-## 特性
+- 文本流式/非流式接口、有序会话上下文，以及严格的工具调用与参数校验。
+- 多账号负载均衡、冷却及账号/工作区绑定的线程复用；不会通过轮换账号绕过 429 限流。
+- Heavy 模式提供事务化完整轮次存储、保留原始归档的迁移和可恢复的摘要压缩。
+- 内置聊天界面支持重命名、收藏、删除、深色模式，以及上游提供的思考和搜索信息。
 
-- **OpenAI 兼容** — 标准 `/v1/chat/completions` 端点，支持流式（SSE）和非流式响应
-- **三种运行模式** — Lite / Standard / Heavy，满足不同使用场景
-- **14 个 AI 模型** — Claude Sonnet/Opus、GPT-5.x、Gemini、Kimi、Grok、DeepSeek
-- **Thinking 面板** — 所有模型均支持推理过程展示
-- **Search 面板** — 展示 Web 搜索查询和来源链接
-- **编码 Agent 兼容** — 接收 OpenAI `tools` / `tool_calls` / `role:"tool"` 消息，并把 Notion 文本输出转换为 OpenAI 工具调用响应
-- **多账号池** — Round-Robin 负载均衡，带冷却故障转移
-- **内置 Web UI** — 极简设计，环境粒子动画，深色模式
-- **Docker 一键部署**
+| 模式 | 上下文 | 数据库 | 思考/搜索面板 |
+|---|---|---|---|
+| Lite | 最后一次用户输入及所提供的指令 | 无 | 不支持 |
+| Standard | 客户端提供的有序历史 | 无 | 上游提供时支持 |
+| Heavy | 最近窗口与摘要；保留完整原始归档 | SQLite | 上游提供时支持 |
 
----
-
-## 三种模式对比
-
-| 特性 | Lite | Standard | Heavy |
-|------|------|----------|-------|
-| **记忆** | ❌ 无 | ✅ 客户端管理 | ✅ 服务端管理 |
-| **数据库** | ❌ | ❌ | ✅ SQLite |
-| **Thinking 面板** | ❌ | ✅ | ✅ |
-| **Search 面板** | ❌ | ✅ | ✅ |
-| **速率限制** | 30/分钟 | 25/分钟 | 20/分钟 |
-| **适用场景** | 简单问答 | 中短对话 | 长期对话 |
-
-> **推荐**：`standard` — 完整上下文，无需数据库。  
-> 修改 `.env` 中的 `APP_MODE` 即可切换。
-
-### 编码 Agent / 工具调用
-
-`/v1/chat/completions` 现在会自动识别带 `tools`、assistant `tool_calls` 或 `role:"tool"` 的请求，并走无状态 Agent 适配路径。该路径会保留 OpenAI 工具循环的消息顺序，返回 `finish_reason: "tool_calls"` 和 OpenAI 兼容的 `message.tool_calls` / streaming `delta.tool_calls`。
-
-建议客户端配置：
-
-```txt
-Provider: OpenAI Compatible
-Base URL: http://localhost:8000/v1
-API Key: 任意非空字符串（如果服务端未强制校验）
-Model ID: claude-sonnet4.6
-```
-
-也支持常见别名，例如 `gpt-4o`、`gpt-4.1`、`claude-sonnet-4`，会映射到 `claude-sonnet4.6`。
-
----
+`.env.example` 选择 `standard`，未设置时的代码默认值为 `heavy`。所有模式统一使用可配置的进程级限制：默认每分钟 20 次请求、4 个并发请求、1 MiB 请求体。带工具的请求走无状态 Agent 适配路径。
 
 ## 快速开始
 
-### 1. 获取 Notion 凭据
-
-根据你的情况选择适合的方式：
-
-#### 方式 A — F12（已有 Notion 网页登录时推荐）
-
-1. 打开 https://www.notion.so/ai 并登录
-2. 按 `F12` → **Application** 标签 → **Storage → Cookies → https://www.notion.so**
-3. 找到 `token_v2`，复制其 Value
-4. 切换到 **Console** 标签，粘贴并运行 `scripts/extract_notion_info.js`
-5. 脚本会输出所有必要字段 — 将结果粘贴到 `accounts.json`
-
-#### 方式 B — 浏览器辅助登录（只有Notion桌面应用，没有网页登录时）
+### 1. 在本地配置账号
 
 ```bash
+python -m pip install -r requirements.txt
 python login.py
+python login.py --check
 ```
 
-会启动一个临时的 Chrome/Edge 窗口，等待你登录 Notion 后，自动提取所有凭据并写入 `accounts.json` 和 `.env`。
+登录辅助脚本还支持 `--list`、`--manual`、`--profile work`。也可通过自己浏览器的开发者工具及 `scripts/extract_notion_info.js` 配置账号。
 
-```bash
-python login.py --check          # 验证已保存的 profile
-python login.py --list           # 列出所有已保存的 profile
-python login.py --manual         # Chrome 不可用时手动粘贴 token_v2
-python login.py --profile work   # 以指定名称保存 profile
-```
+`accounts.json` 应是非空 JSON 数组，每个账号必须包含 `token_v2`、`space_id`、`user_id`。这些凭据代表你的 Notion 账号权限，请使用最小权限账号，切勿提交、分享或发送给不可信服务。`.env` 与 `accounts.json` 均已被 Git 忽略。
 
-两种方式都写入 `accounts.json`。支持多账号 — 在数组中添加更多条目即可启用负载均衡。
-
-> ⚠️ `accounts.json` 和 `.env` 包含凭据，两者均已被 git 忽略 — 请妥善保管。
-
----
-
-### 2. 配置 `.env`
+### 2. 设置服务认证
 
 ```bash
 cp .env.example .env
+python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
-至少需要设置：
+将生成的随机值写入 `.env` 的 `API_KEY`，客户端必须使用**相同的值**，不能再随意填写其他字符串。空密钥会阻止服务启动，除非明确设置 `ALLOW_UNAUTHENTICATED=true`；该选项仅适合可信本地环境。
 
 ```env
-APP_MODE=standard   # lite / standard / heavy
+API_KEY=replace-with-your-generated-key
+APP_MODE=standard
+HOST=127.0.0.1
+PORT=8000
 ```
 
-如果使用 **Heavy 模式**，还需添加：
+部署环境变量优先于 `.env`；设置 `NOTION_ACCOUNTS` 时，它优先于 `accounts.json`。使用账号文件前，请移除过期的环境变量覆盖。
 
-```env
-SILICONFLOW_API_KEY=your_key_here
-```
+Heavy 模式可选配置 `SILICONFLOW_API_KEY` 及 `SILICONFLOW_MODEL`（默认 `Qwen/Qwen3-8B`）。启用后会将较早的对话内容发送给 SiliconFlow 生成摘要。未启用或压缩失败时只注入有限的最近窗口，并报告记忆降级；原始归档仍保留。
 
-> Heavy 模式使用 SiliconFlow 的 LLM 来压缩长对话。前往 https://siliconflow.cn 免费注册。
-
----
-
-### 3. 启动服务
-
-#### Docker（推荐）
+### 3. 单进程启动
 
 ```bash
-docker-compose build --no-cache && docker-compose up -d
+uvicorn app.server:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-`accounts.json` 通过 volume 挂载 — 更新账号无需重新构建：
+或在准备好 `.env` 和 `accounts.json` 后：
 
 ```bash
-# 编辑 accounts.json 后：
-docker-compose restart
+docker compose up --build -d
 ```
 
-#### 本地运行
+Docker 默认仅将宿主机端口绑定到 `127.0.0.1`，容器内监听 `0.0.0.0`。公开访问需要明确修改 `HOST_BIND` 并配置 TLS、认证和网络控制。请使用一个 worker：会话生成锁和请求配额不是分布式的。
 
-```bash
-pip install -r requirements.txt
-uvicorn app.server:app --host 0.0.0.0 --port 8000
-```
-
-访问 `http://localhost:8000` 即可使用 Web UI。
-
----
-
-## 支持的模型
-
-| 模型名称 | 说明 |
-|---|---|
-| `claude-sonnet4.6` | 速度与质量的最佳平衡 — **最推荐** |
-| `claude-sonnet5` | 最新 Sonnet，推理与 agent 能力更强 |
-| `claude-opus4.6` | 推理能力更强，建议适量使用 |
-| `claude-opus4.7` | 更强推理能力 |
-| `claude-opus4.8` | 最新 Claude，推理能力最强 |
-| `gpt-5.5` | 最新 GPT（Beta） |
-| `gpt-5.4` | OpenAI 模型 |
-| `gpt-5.2` | OpenAI 模型 |
-| `gemini-2.5flash` | 原生快速，无 thinking 延迟 — 快速任务首选 |
-| `gemini-3.1pro` | Google 最强推理模型 |
-| `kimi-2.6` | Moonshot AI（Beta） |
-| `grok-4.3` | xAI Grok 4.3 |
-| `grok-build0.1` | xAI Grok Build 0.1 |
-| `deepseek-v4pro` | DeepSeek V4 Pro |
-
-完整列表：`GET http://localhost:8000/v1/models`
-
----
+访问 `http://localhost:8000` 使用界面。不要直接打开原始 `frontend/index.html`，运行中的服务会为它加载统一的浏览器安全层。
 
 ## API 使用
 
-本项目接受任意字符串作为 API key，无格式要求。
-
-### Python 示例
-
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://localhost:8000/v1",
-    api_key="any-string"
-)
-
-response = client.chat.completions.create(
-    model="claude-sonnet4.6",
-    messages=[{"role": "user", "content": "你好"}],
-    stream=True
-)
-
-for chunk in response:
-    print(chunk.choices[0].delta.content or "", end="")
+```text
+Provider: OpenAI Compatible
+Base URL: http://localhost:8000/v1
+API Key: 与服务端 API_KEY 完全相同
+Model: claude-sonnet4.6
 ```
 
-### 端点
+Python SDK 示例见 [英文说明](README_EG.md#api-usage)。不要发送 `temperature`、`top_p`、`max_tokens` 或 `max_completion_tokens`：当前上游适配器无法可靠支持它们，因此明确返回 400，而不是静默忽略。图片、音频、多候选输出和旧版请求级 `functions` 不受支持。
 
-| 端点 | 方法 | 说明 |
+工具调用必须符合所提供的名称、JSON 对象参数、schema、`tool_choice` 和并行限制；不会凭空构造成功的 `attempt_completion` 调用。系统/开发者消息内容会被保留，但这是上游文本适配，不等同于 OpenAI 原生角色隔离。
+
+普通 OpenAI 客户端会在上游输出最终确定后收到缓冲后的正文及思考文本，因为上游可以替换已经生成的内容。内置界面支持临时输出及替换事件。没有固定首 token 延迟保证，token 用量也未被实际计量。
+
+| 端点 | 方法 | 用途 |
 |---|---|---|
-| `/v1/chat/completions` | POST | 聊天补全（核心） |
-| `/v1/models` | GET | 列出可用模型 |
-| `/health` | GET | 健康检查（账号池状态、运行时间） |
-| `/` | GET | 内置 Web UI |
+| `/v1/chat/completions` | POST | 文本补全和工具适配 |
+| `/v1/models` | GET | 模型注册表；需要认证 |
+| `/v1/conversations/{id}` | DELETE | 仅删除本地 SQLite 历史 |
+| `/health` | GET | 账号池状态和运行时间 |
+| `/` | GET | 内置界面 |
 
----
+## 模型注册表
 
-## Web UI
+当前 ID：`claude-sonnet4.6`、`claude-sonnet5`、`claude-opus4.6`、`claude-opus4.7`、`claude-opus4.8`、`gpt-5.2`、`gpt-5.4`、`gpt-5.5`、`gemini-2.5flash`、`gemini-3.1pro`、`kimi-2.6`、`grok-4.3`、`grok-build0.1`、`deepseek-v4pro`。
 
-访问 `http://localhost:8000`，使用内置的 **Notion AI Studio** 界面：
+是否可用取决于实际账号与上游，这些标签不是对模型供应商能力的保证。已有别名 `gpt-4o`、`gpt-4.1`、`claude-sonnet-4` 等仍映射到 `claude-sonnet4.6`；未知 ID 会被拒绝，不再静默降级。
 
-- **对话管理** — 新建、重命名、删除、收藏/置顶
-- **模型选择器** — 按服务商分组（Anthropic / OpenAI / Google / Moonshot / xAI / DeepSeek）
-- **Thinking 面板** — 可折叠的推理过程展示，带计时器
-- **Search 面板** — 可折叠的搜索查询和来源链接
-- **环境粒子动画** — 天气效果：默认 / 雪 / 雨 / 晴天 / 夜晚
-- **主题** — 亮色/暗色模式切换
-- **响应式** — 移动端侧边栏适配
+## 运维与隐私
 
-> Thinking 和 Search 面板需要 `standard` 或 `heavy` 模式。
+- 所有通过认证的客户端共享账号池和会话存储，**并无租户隔离**。请求上游只读模式不能替代真实权限控制。
+- 收到 429 时尊重 `Retry-After`；凭据过期时在本地刷新。401/403 账号在当前进程中会被禁用，需要更新配置并重启。
+- 浏览器密钥仅存于当前会话；损坏的聊天存储不会被自动覆盖。存储不可用或容量不足会显示警告。
+- 中断的响应保留部分内容，并从后续正常历史提交中排除。
+- 本地删除不代表 Notion 线程或备份已被删除，请自行制定保留策略。
+- Docker 健康检查仅标记状态；`restart: always` 本身不会重启仍在运行的 unhealthy 进程。
+- 反向代理需关闭响应缓冲、允许足够超时时间，并明确配置可信的转发地址。
 
----
+完整配置见 [.env.example](.env.example)。旧的 `DISABLE_RATE_LIMIT` 配置不再受支持。
 
-## 环境变量
-
-| 变量 | 说明 | 默认值 |
-|---|---|---|
-| `NOTION_ACCOUNTS` | Notion 凭据 JSON 数组 | **必填** |
-| `APP_MODE` | `lite` / `standard` / `heavy` | `heavy` |
-| `API_KEY` | 客户端认证 Bearer Token | *(无)* |
-| `DB_PATH` | SQLite 数据库路径 | `./data/conversations.db` |
-| `HOST` | 服务绑定地址 | `0.0.0.0` |
-| `PORT` | 服务端口 | `8000` |
-| `HOST_PORT` | Docker 宿主机端口 | `8000` |
-| `ALLOWED_ORIGINS` | CORS 允许的域名 | `*` |
-| `SILICONFLOW_API_KEY` | Heavy 模式压缩服务密钥 | *(无)* |
-| `DISABLE_RATE_LIMIT` | 关闭按 IP 速率限制 | `false` |
-| `NOTION_CLIENT_VERSION` | 覆盖 Notion 客户端版本号 | `23.13.20260228.0625` |
-| `LOG_LEVEL` | 日志级别 | `INFO` |
-| `TZ` | 时区 | `Asia/Shanghai` |
-
----
-
-## Docker 参考
+## 验证
 
 ```bash
-# 启动
-docker-compose up -d
-
-# 查看日志
-docker-compose logs -f --tail=50
-
-# 重启（如更新 accounts.json 后）
-docker-compose restart
-
-# 更新代码并重新部署
-git pull && docker-compose down && docker-compose build --no-cache && docker-compose up -d
-
-# 停止
-docker-compose down
+python -m compileall -q app main.py tests
+python -m unittest discover -s tests -v
+node --test tests/frontend.test.cjs
 ```
 
-### Nginx 反向代理（可选）
+建议 Python 3.11+ 和 Node 20+。测试使用假凭据、模拟网络和临时数据库。**本分支尚未执行这些测试**：连接的 GitHub 在写入工作流文件时返回 HTTP 404，因此没有成功的 CI 结果。合并前需验证各上游模型、浏览器流程和旧数据库迁移，并审计与锁定依赖；当前版本范围不是锁文件或漏洞审计结果。
 
-```nginx
-location / {
-    proxy_pass http://127.0.0.1:8000;
-    proxy_set_header Host $host;
-    proxy_buffering off;
-    proxy_cache off;
-    proxy_read_timeout 300s;
-}
-```
+## 许可证与来源
 
----
+MIT License。原始项目：[maverickxone/notion2api](https://github.com/maverickxone/notion2api)。
 
-## 常见问题
-
-**Thinking 面板不显示？**  
-请使用 `APP_MODE=standard` 或 `heavy`，Lite 模式不支持 Thinking 和 Search 面板。
-
-**如何切换模式？**  
-修改 `.env` 中的 `APP_MODE`，然后重启：`docker-compose restart`
-
-**如何添加多账号？**  
-将 `accounts.json` 编辑为数组格式 — 账号会自动进行负载均衡：
-```json
-[
-  {"token_v2": "token1", "space_id": "...", "user_id": "...", "space_view_id": "...", "user_name": "...", "user_email": "..."},
-  {"token_v2": "token2", "space_id": "...", "user_id": "...", "space_view_id": "...", "user_name": "...", "user_email": "..."}
-]
-```
-
-**收到 429 或 Notion AI 功能被暂停？**  
-Notion 可能会对请求模式异常的工作区进行限流。添加多账号有助于分散负载，Business Trial 工作区尤其容易触发。
-
-**Token 过期了？**  
-重新运行 `python login.py` 或重复 F12 步骤刷新凭据。
-
----
-
-## 兼容性
-
-> 由于 Notion AI 本身的调用延迟，从发出请求到收到第一个 token 通常需要约 3 秒。
-
-| 客户端 | 状态 | 备注 |
-|---|---|---|
-| Cherry Studio | ✅ 完全支持 | 推荐 |
-| Zotero 翻译 | ✅ 完全支持 | 速度略慢，sonnet 模型最准确 |
-| 沉浸式翻译 | ⚠️ 不推荐 | 延迟过高 |
-| Claude Code | ❌ 不支持 | 使用 Anthropic 原生 API 格式 |
-
----
-
-## 许可证
-
-MIT License
-
----
-
-如果这个项目对你有帮助，请给个 Star ⭐
-
-*本项目使用 Claude Code 辅助完成。*
-
-## Star History
-
-<a href="https://www.star-history.com/?repos=maverickxone%2Fnotion2api&type=date&legend=bottom-right">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=maverickxone/notion2api&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=maverickxone/notion2api&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=maverickxone/notion2api&type=date&legend=top-left" />
- </picture>
-</a>
+*原始项目使用 Claude Code 辅助完成。*

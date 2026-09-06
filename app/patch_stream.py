@@ -95,9 +95,8 @@ def _texts(step, inherited='content'):
 def _snapshot(document, initial_refs, initial_ids):
     result = {'content': '', 'thinking': ''}
     for step in document.get('s', []):
-        # Object identity keeps inserted-at-zero responses separate from input
-        # history. Stable IDs also exclude input records in a full replacement.
-        if id(step) in initial_refs or (isinstance(step, dict) and step.get('id') in initial_ids):
+        identifier = step.get('id') if isinstance(step, dict) else None
+        if id(step) in initial_refs or (isinstance(identifier, str) and identifier in initial_ids):
             continue
         for role, text in _texts(step):
             result[role] += text
@@ -109,11 +108,12 @@ def parse(response, initial_transcript=None):
                                    _extract_markdown_chat_text, _extract_search_data_from_patch)
     initial = copy.deepcopy(initial_transcript or [])
     document = {'s': initial}
-    initial_refs = {id(step) for step in initial}
-    initial_ids = {step['id'] for step in initial if isinstance(step, dict) and isinstance(step.get('id'), str)}
+    # Keep strong references so replaced seed objects cannot have their IDs reused.
+    initial_objects = tuple(initial)
+    initial_refs = {id(step) for step in initial_objects}
+    initial_ids = {step['id'] for step in initial_objects if isinstance(step, dict) and isinstance(step.get('id'), str)}
     previous = {'content': '', 'thinking': ''}
-    fallback = None
-    markdown_final = None
+    fallback, markdown_final, body_seen = None, None, False
     for line in response.iter_lines(decode_unicode=True):
         if not line:
             continue
@@ -155,6 +155,7 @@ def parse(response, initial_transcript=None):
                     yield {'type': 'search', 'data': metadata}
             _apply(document, patch)
             current = _snapshot(document, initial_refs, initial_ids)
+            body_seen = body_seen or bool(current['content'])
             for role, text in current.items():
                 old = previous[role]
                 if text != old:
@@ -164,9 +165,10 @@ def parse(response, initial_transcript=None):
                         yield {'type': role + '_replace', 'text': text}
             previous = current
     final = _snapshot(document, initial_refs, initial_ids)
-    # A direct markdown-chat snapshot refers to this response. An uncorrelated
-    # record-map is only a fallback; it must not overwrite reconstructed output.
-    body = markdown_final if markdown_final is not None else final['content'] or fallback or ''
+    # Do not resurrect deleted body text from an uncorrelated record-map fallback.
+    body = markdown_final if markdown_final is not None else final['content'] if body_seen else fallback or ''
+    if not body and not final['thinking']:
+        raise ChunkedEncodingError('Empty upstream answer.')
     yield {'type': 'final_thinking', 'text': final['thinking']}
     yield {'type': 'final_content', 'text': _clean_extracted_text(body),
-           'source_type': 'markdown-chat' if markdown_final is not None else 'reconstructed-patches' if final['content'] else 'record-map'}
+           'source_type': 'markdown-chat' if markdown_final is not None else 'reconstructed-patches' if body_seen else 'record-map'}
