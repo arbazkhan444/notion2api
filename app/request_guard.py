@@ -1,6 +1,5 @@
-"""Process-local admission control, including the entire streaming lifetime."""
+"""Process-local admission control for the entire request/stream lifetime."""
 from __future__ import annotations
-
 import os
 from collections import defaultdict, deque
 from time import monotonic
@@ -10,11 +9,11 @@ from starlette.responses import JSONResponse
 class RequestGuard:
     def __init__(self, app, max_concurrent=None, max_body=None, per_minute=None):
         self.app = app
-        self.max_concurrent = max_concurrent or int(os.getenv('MAX_CONCURRENT_REQUESTS', '4'))
-        self.max_body = max_body or int(os.getenv('MAX_REQUEST_BYTES', '1048576'))
-        self.per_minute = per_minute or int(os.getenv('REQUESTS_PER_MINUTE', '20'))
-        if min(self.max_concurrent, self.max_body, self.per_minute) < 1:
-            raise ValueError('Request limits must be positive.')
+        self.max_concurrent = int(os.getenv('MAX_CONCURRENT_REQUESTS', '4')) if max_concurrent is None else max_concurrent
+        self.max_body = int(os.getenv('MAX_REQUEST_BYTES', '1048576')) if max_body is None else max_body
+        self.per_minute = int(os.getenv('REQUESTS_PER_MINUTE', '20')) if per_minute is None else per_minute
+        if any(type(value) is not int or value < 1 for value in (self.max_concurrent, self.max_body, self.per_minute)):
+            raise ValueError('Request limits must be positive integers.')
         self.active = 0
         self.requests = defaultdict(deque)
         self.last_prune = 0.0
@@ -36,7 +35,7 @@ class RequestGuard:
                 if not queue:
                     del self.requests[key]
             self.last_prune = now
-        # Do not trust X-Forwarded-For here. Configure the ASGI server's trusted proxies.
+        # The ASGI server must configure trusted proxies; do not trust arbitrary forwarding headers.
         key = (scope.get('client') or ('unknown', 0))[0]
         queue = self.requests[key]
         while queue and queue[0] <= now - 60:
@@ -53,9 +52,10 @@ class RequestGuard:
                     return
                 if message['type'] != 'http.request':
                     continue
-                body.extend(message.get('body', b''))
-                if len(body) > self.max_body:
+                chunk = message.get('body', b'')
+                if len(body) + len(chunk) > self.max_body:
                     return await self._error(scope, receive, send, 413, 'Request body is too large.')
+                body.extend(chunk)
                 if not message.get('more_body', False):
                     break
             delivered = False
