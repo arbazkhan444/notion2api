@@ -4,38 +4,67 @@ This is a text-only adapter to a private, changeable upstream protocol, not a co
 
 ## Supported contract
 
-- Public model IDs and documented aliases; model mapping is idempotent at the transport boundary.
-- Ordered system/developer, user, assistant, tool-call and tool-result context. No silent tool-result truncation.
-- Function tools with JSON-object arguments validated against the supplied schema; local JSON Schema references are supported. Remote schema retrieval is forbidden.
-- `tool_choice` (`auto`, `none`, `required`, or a named function), `parallel_tool_calls`, text stop sequences, and validated JSON response formats.
-- Text message parts only. Images, audio, legacy request-level `functions`, multiple choices, sampling settings, and exact token limits are rejected with a clear 400 rather than silently ignored. In particular, omit `temperature`, `top_p`, `max_tokens`, and `max_completion_tokens`.
+- Registry model IDs and documented aliases; model mapping is idempotent at the transport boundary. Registry names do not guarantee a model is available to your account.
+- Ordered user/assistant/tool context; system/developer content is retained as instructions in the upstream transcript. This is an adaptation, not native OpenAI role isolation.
+- Function tools with JSON-object arguments checked against the supplied schema. Local JSON Schema references work; remote schema retrieval is forbidden.
+- `tool_choice` (`auto`, `none`, `required`, or a named function), `parallel_tool_calls`, text stop sequences, and validated JSON-object response formats.
+- Text message parts only. Images, audio, legacy request-level `functions`, multiple choices, sampling settings, and exact token limits are rejected rather than silently ignored. Omit `temperature`, `top_p`, `max_tokens`, and `max_completion_tokens`.
+- Token usage is not measured; existing zero-valued usage fields must not be used for billing or budget enforcement.
 
 ## Streaming and failures
 
-All normal events contain OpenAI `choices`. Optional web metadata uses the same envelope. Upstream failure emits an `error` event without a successful `finish_reason`; no error is turned into an `attempt_completion` call. HTTP errors before streaming remain HTTP errors.
+Normal events have OpenAI `choices`; optional web metadata uses that envelope too. Failure emits an `error` event without a successful `finish_reason`. Errors and tool failures are never converted into fabricated `attempt_completion` calls. Failures before streaming remain HTTP errors.
 
-The upstream can replace generated text. Ordinary OpenAI clients therefore receive finalized answer text after buffering; reasoning can stream separately. The bundled web client supports body replacement. Agent output is buffered until its tool calls are fully validated. This deliberately favors correctness over time-to-first-answer-token.
+The upstream can replace both generated answer and reasoning text. Ordinary OpenAI clients therefore receive finalized text after buffering. The bundled web client accepts explicit answer/reasoning replacements and can display provisional output. Agent output is buffered until its complete function calls have been validated. This favors correctness over time-to-first-answer-token; it is not token-for-token pass-through streaming.
 
-The private upstream's full termination protocol and all provider-specific patch variants still require live integration validation. Network interruption exceptions are handled; an upstream that silently terminates a syntactically valid stream without an explicit failure may require further protocol-specific detection.
+The private upstream's full termination protocol and all provider-specific patch variants still require live validation. Network interruption exceptions are handled; a syntactically valid silent EOF without an explicit error may require more protocol-specific detection. Record maps without current-response correlation remain fallback data rather than authoritative replacements.
 
 ## Stateful conversations
 
-Complete turns are allocated inside SQLite write transactions. Imports reconcile full history or an overlapping history window; conflicting edits require a new conversation ID. Archive rows are retained. Legacy missing window rows are backfilled, but previously overwritten/conflicting archive turns cannot be automatically reconstructed with certainty.
+Complete turns are allocated inside SQLite write transactions. Imports reconcile full history or an overlapping client window; conflicting edits require a new conversation ID. Archive rows are retained. Legacy missing window rows are backfilled; ambiguous archive collisions stop reuse instead of silently selecting a turn. Back up the SQLite database before upgrading. Previously overwritten data cannot be reconstructed with certainty.
 
-Only reuse an upstream thread when its stored model, account, and workspace match. Existing bindings without owner metadata are recreated. The configured single-worker server serializes turns within a conversation; SQLite protects round allocation across processes, but multi-worker deployments need a distributed generation lock and shared rate-limit storage.
+An upstream thread is reused only when its stored account, workspace, and model match. Ownerless old bindings are recreated. The single-worker service serializes generation within a conversation. SQLite protects allocation across processes, but multiple workers still need distributed generation locks, shared quotas, and coordinated compression.
 
-Compression has one pipeline, a recoverable lease, atomic summary publication, and a truthful degraded-memory indicator. Without a working summarizer, only the configured recent window is injected; archived history remains stored. This is bounded context, not unlimited memory.
+Compression uses a per-conversation pipeline, recoverable leases, and atomic summary publication. Pending/failed raw turns stay available in the recent window. Without a working summarizer, the bounded recent window is injected and memory degradation is reported; the full archive is retained. This is bounded context, not unlimited memory.
 
-## Deployment changes
+Completed upstream responses may be saved before the client receives the final network bytes. This API does not provide exactly-once delivery or request-level idempotency keys; inspect conversation state before replaying an interrupted stateful request.
 
-Set a nonempty `API_KEY`. Unauthenticated use requires explicit `ALLOW_UNAUTHENTICATED=true` and should be restricted to a trusted local environment. The Docker host port binds to loopback by default. The service still has one shared trust boundary; it is not a tenant-isolated hosting service.
+## Deployment and privacy
 
-`REQUESTS_PER_MINUTE` (default 20), `MAX_CONCURRENT_REQUESTS` (4), and `MAX_REQUEST_BYTES` (1048576) are enforced per process. Streaming requests occupy a concurrency slot until closed. Configure trusted proxies explicitly; the limiter does not trust arbitrary forwarding headers.
+Set a nonempty random `API_KEY`. Unauthenticated use requires explicit `ALLOW_UNAUTHENTICATED=true` and should remain trusted-local only. Docker host ports bind to loopback by default. CORS defaults to local origins, not `*`. Deployment environment values override `.env`; `NOTION_ACCOUNTS` overrides `accounts.json`.
 
-The summarizer uses `SILICONFLOW_API_KEY` only with SiliconFlow's API. `SILICONFLOW_MODEL` selects the model (default `Qwen/Qwen3-8B`). Conversation text is sent to that provider when summarization is enabled. Browser storage is best-effort and reports persistence failures; browser API keys are session-only.
+`REQUESTS_PER_MINUTE` (default 20), `MAX_CONCURRENT_REQUESTS` (4), and `MAX_REQUEST_BYTES` (1048576) apply per process. A stream occupies its concurrency slot until the downstream application closes. The limiter uses the ASGI client address, not arbitrary forwarding headers. Configure the server's trusted proxies explicitly when deploying behind a proxy.
 
-Conversation deletion removes local SQLite data only. Upstream thread retention is separate; do not represent a local deletion as deletion from Notion. Use a least-privileged dedicated upstream account and an explicit retention policy before serving other users.
+There is one shared trust boundary, not tenant isolation. Authenticated clients share the configured account pool and conversation store. Read-only mode is requested upstream but is not a substitute for least-privilege accounts and actual Notion permissions. Do not expose this service to untrusted users.
 
-## Verification
+Summarization sends older conversation text to SiliconFlow when `SILICONFLOW_API_KEY` is configured. That key is used only with SiliconFlow. `SILICONFLOW_MODEL` defaults to `Qwen/Qwen3-8B`. No fallback provider receives it.
 
-The new regression suite imports the actual patched application. It uses fake accounts, mocked transports, and temporary SQLite databases; it must not call production Notion or summarizer endpoints. GitHub Actions runs Python and browser-logic checks. A passing mocked suite is not proof that the private upstream accepts every payload.
+Local conversation deletion removes SQLite data only; Notion thread retention is separate. Define retention and backup policies before storing sensitive data. Application logs use metadata rather than prompts or credentials. Dependency versions have bounds, not a fully resolved lockfile or a completed vulnerability audit.
+
+## Browser implementation
+
+The original layout/template is preserved. `app/frontend_view.py` serves both `/` and `/index.html`, wraps boot-time storage access, and loads `safe-browser.js`, `stream-reader.js`, and `app-fixes.js` before initialization. The older `frontend/js` copies are not the served application's authority. A changed template marker fails startup rather than silently dropping this safety layer.
+
+Browser API keys migrate to session-only storage. Chat persistence is best-effort with visible warnings; corrupt chat data is not overwritten during recovery. Interrupted turns retain partial output and are excluded from subsequent successful-history submissions. Search navigation accepts only HTTP(S). Ordinary Markdown link labels are preserved.
+
+## Verification status
+
+**Tests are committed but have not been executed for this branch.** GitHub MCP accepted source commits but returned HTTP 404 for attempts to add workflow files. No Actions workflow or successful application-test result was produced. Prior excerpt/SQL checks from the review are not validation of these fixes.
+
+The suites import the actual application and use fake accounts, mocked transports, temporary SQLite databases, and browser logic fixtures. To validate in an authorized environment, with Python 3.11+ and Node 20+:
+
+```bash
+python -m pip install -r requirements.txt
+python -m compileall -q app main.py tests
+python -m unittest discover -s tests -v
+node --test tests/frontend.test.cjs
+```
+
+Before removing draft status:
+
+- [ ] Run all checks above and review failures.
+- [ ] Validate migrations against a backed-up copy of a real legacy database.
+- [ ] Exercise all model/provider transcript and patch variants with a dedicated test account.
+- [ ] Exercise browser rename, storage denial/quota, cancellation, and reconnect behavior.
+- [ ] Verify proxy authentication, limits, thread ownership, and retention settings.
+- [ ] Audit and lock deployment dependencies.
