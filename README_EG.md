@@ -1,311 +1,148 @@
 # Notion2API
 
-> Notion AI → OpenAI-Compatible API
+> Notion AI → a limited, text-only OpenAI-compatible API
 
 🌐 English | [中文](./README.md)
 
-Notion2API reverse-engineers the Notion AI web interface and exposes it as a standard `/v1/chat/completions` endpoint, making it directly usable with Cherry Studio, Zotero, and any other OpenAI-compatible client.
+Notion2API adapts Notion AI's private web interface to `/v1/chat/completions`. The private protocol and model availability can change. It is not a complete OpenAI implementation or a multi-tenant hosting service.
 
----
+> **Review-fix branch:** source changes and regression tests are committed, but tests and live upstream integration have **not been executed**. Read [API compatibility and validation](docs/API_COMPATIBILITY.md) before deploying. Back up existing SQLite data and validate in a dedicated test environment first.
 
-## Features
+## Features and modes
 
-- **OpenAI Compatible** — Standard `/v1/chat/completions` endpoint, streaming (SSE) and non-streaming
-- **Three Operation Modes** — Lite / Standard / Heavy to fit different use cases
-- **13 AI Models** — Claude Sonnet/Opus, GPT-5.x, Gemini, Kimi, Grok, DeepSeek
-- **Thinking Panel** — Reasoning process display for all models
-- **Search Panel** — Web search queries and source links
-- **Coding Agent Compatibility** — Accepts OpenAI `tools` / `tool_calls` / `role:"tool"` messages and converts Notion text output into OpenAI tool-call responses
-- **Multi-Account Pool** — Round-Robin load balancing with cooldown failover
-- **Built-in Web UI** — Minimalist design, ambient animations, dark mode
-- **Docker Ready** — One-command deployment
+- Text streaming/non-streaming, ordered conversation context, and strict function-call/schema validation.
+- Account pool with cooldowns and account/workspace-bound thread reuse; 429 responses are respected, not bypassed by rotation.
+- SQLite atomic complete turns, archive-preserving migration, and recoverable summarization in Heavy mode.
+- Built-in chat UI with dark mode, rename/star/delete, reasoning and search panels when available, and interrupted-response recovery.
 
----
+| Mode | Context | Database | Reasoning/search UI |
+|---|---|---|---|
+| Lite | Last user prompt and supplied instructions | None | No |
+| Standard | Client-supplied ordered history | None | When upstream provides it |
+| Heavy | Recent window plus summaries; full archive retained | SQLite | When upstream provides it |
 
-## Mode Comparison
+The example `.env` selects `standard`; the code fallback is `heavy`. All modes use the same configurable process-local request limits (default 20 requests/minute, 4 concurrent requests, 1 MiB request body). Tool requests use a stateless agent adapter regardless of the configured mode.
 
-| Feature | Lite | Standard | Heavy |
-|---------|------|----------|-------|
-| **Memory** | ❌ None | ✅ Client-managed | ✅ Server-managed |
-| **Database** | ❌ | ❌ | ✅ SQLite |
-| **Thinking Panel** | ❌ | ✅ | ✅ |
-| **Search Panel** | ❌ | ✅ | ✅ |
-| **Rate Limit** | 30/min | 25/min | 20/min |
-| **Use Case** | Simple Q&A | Short–mid conversations | Long-term conversations |
+## Setup
 
-> **Recommended**: `standard` — full context, no database required.  
-> Switch by setting `APP_MODE` in `.env`.
+### 1. Configure an account privately
 
-### Coding Agents / Tool Calling
-
-`/v1/chat/completions` automatically detects requests with `tools`, assistant `tool_calls`, or `role:"tool"` messages and routes them through a stateless agent adapter. This preserves OpenAI tool-loop message order and returns `finish_reason: "tool_calls"` plus OpenAI-compatible `message.tool_calls` / streaming `delta.tool_calls`.
-
-Suggested client setup:
-
-```txt
-Provider: OpenAI Compatible
-Base URL: http://localhost:8000/v1
-API Key: any non-empty string if your server does not enforce one
-Model ID: claude-sonnet4.6
-```
-
-Common aliases such as `gpt-4o`, `gpt-4.1`, and `claude-sonnet-4` are accepted and mapped to `claude-sonnet4.6`.
-
----
-
-## Quick Start
-
-### 1. Get Notion Credentials
-
-Choose the method that fits your situation:
-
-#### Method A — F12 (if you already have a Notion web session)
-
-1. Open https://www.notion.so/ai and log in
-2. Press `F12` → **Application** tab → **Storage → Cookies → https://www.notion.so**
-3. Find `token_v2` and copy its Value
-4. Switch to the **Console** tab, paste and run `scripts/extract_notion_info.js`
-5. The script outputs all required fields — paste the result into `accounts.json`
-
-#### Method B — Browser-Assisted Login (no existing web session needed)
+Install the requirements, then use the existing local login helper:
 
 ```bash
+python -m pip install -r requirements.txt
 python login.py
+python login.py --check
 ```
 
-This launches a temporary Chrome/Edge window, waits for you to sign in to Notion, then automatically extracts all credentials and writes them to `accounts.json` and `.env`.
+Other helper options include `--list`, `--manual`, and `--profile work`. Alternatively, use your browser's developer tools and the repository's `scripts/extract_notion_info.js` to configure your own account.
 
-```bash
-python login.py --check          # verify a saved profile
-python login.py --list           # list all saved profiles
-python login.py --manual         # paste token_v2 manually if Chrome is unavailable
-python login.py --profile work   # save under a named profile
-```
+`accounts.json` must contain a nonempty array with `token_v2`, `space_id`, and `user_id`. Additional profile fields are optional. These credentials grant access to the configured Notion account: keep them private, use least privilege, and do not commit them. Both `.env` and `accounts.json` are ignored by Git.
 
-Both methods write to `accounts.json`. Multiple accounts are supported — add more entries to the array to enable load balancing.
-
-> ⚠️ `accounts.json` and `.env` contain credentials. Both are git-ignored — keep them private.
-
----
-
-### 2. Configure `.env`
+### 2. Configure service authentication
 
 ```bash
 cp .env.example .env
+python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
-At minimum, set:
+Put the generated value in `.env` as `API_KEY`, and use that **same value** in clients. An arbitrary non-matching key no longer works. Empty keys fail startup unless `ALLOW_UNAUTHENTICATED=true` is explicitly enabled for trusted-local use.
 
 ```env
-APP_MODE=standard   # lite / standard / heavy
+API_KEY=replace-with-your-generated-key
+APP_MODE=standard
+HOST=127.0.0.1
+PORT=8000
 ```
 
-If using **Heavy mode**, also add:
+Deployment environment values take precedence over `.env`. If set, `NOTION_ACCOUNTS` takes precedence over `accounts.json`; remove a stale environment override before relying on the file.
 
-```env
-SILICONFLOW_API_KEY=your_key_here
-```
+For optional Heavy-mode summarization, set `SILICONFLOW_API_KEY` and optionally `SILICONFLOW_MODEL` (default `Qwen/Qwen3-8B`). This sends older conversation turns to SiliconFlow. Without a working summarizer, only the recent window is injected and degraded memory is reported; the raw archive remains stored.
 
-> Heavy mode uses SiliconFlow's LLM to compress long conversations. Register free at https://siliconflow.cn.
-
----
-
-### 3. Start the Service
-
-#### Docker (Recommended)
+### 3. Start one worker
 
 ```bash
-docker-compose build --no-cache && docker-compose up -d
+uvicorn app.server:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-`accounts.json` is mounted as a volume — update accounts without rebuilding:
+Or, after configuring `.env` and `accounts.json`:
 
 ```bash
-# After editing accounts.json:
-docker-compose restart
+docker compose up --build -d
 ```
 
-#### Local Run
+Docker binds the **host** port to `127.0.0.1` by default and the container listener to `0.0.0.0`. Public access requires an explicit `HOST_BIND` override plus appropriate TLS/authentication and network controls. Run one worker: conversation-generation locks and quotas are process-local.
 
-```bash
-pip install -r requirements.txt
-uvicorn app.server:app --host 0.0.0.0 --port 8000
+Open `http://localhost:8000` for the UI. Use the running application, not the raw `frontend/index.html`: the server supplies its shared browser-safety layer.
+
+## API usage
+
+Suggested client settings:
+
+```text
+Provider: OpenAI Compatible
+Base URL: http://localhost:8000/v1
+API Key: the exact configured API_KEY
+Model: claude-sonnet4.6
 ```
 
-Access the Web UI at `http://localhost:8000`.
-
----
-
-## Supported Models
-
-| Model Name | Description |
-|---|---|
-| `claude-sonnet4.6` | Best balance of speed and quality — **most recommended** |
-| `claude-opus4.6` | Stronger reasoning, use sparingly |
-| `claude-opus4.7` | Stronger reasoning |
-| `claude-opus4.8` | Newest Claude, strongest reasoning |
-| `gpt-5.5` | Latest GPT (Beta) |
-| `gpt-5.4` | OpenAI model |
-| `gpt-5.2` | OpenAI model |
-| `gemini-2.5flash` | Native fast, no thinking delay — great for quick tasks |
-| `gemini-3.1pro` | Google's strongest reasoning model |
-| `kimi-2.6` | Moonshot AI (Beta) |
-| `grok-4.3` | xAI Grok 4.3 |
-| `grok-build0.1` | xAI Grok Build 0.1 |
-| `deepseek-v4pro` | DeepSeek V4 Pro |
-
-Full list via API: `GET http://localhost:8000/v1/models`
-
----
-
-## API Usage
-
-This project accepts any string as the API key (no format requirement).
-
-### Python Example
+Example using the optional OpenAI Python SDK, with `API_KEY` exported in your shell:
 
 ```python
+import os
 from openai import OpenAI
 
-client = OpenAI(
-    base_url="http://localhost:8000/v1",
-    api_key="any-string"
-)
-
+client = OpenAI(base_url="http://localhost:8000/v1", api_key=os.environ["API_KEY"])
 response = client.chat.completions.create(
     model="claude-sonnet4.6",
     messages=[{"role": "user", "content": "Hello"}],
-    stream=True
+    stream=True,
 )
-
 for chunk in response:
     print(chunk.choices[0].delta.content or "", end="")
 ```
 
-### Endpoints
+Do not send unsupported `temperature`, `top_p`, `max_tokens`, or `max_completion_tokens`; these return 400 instead of being silently ignored. Images, audio, multiple choices, and legacy request-level `functions` are not supported. Function calls must satisfy supplied schemas and `tool_choice`; invalid upstream output becomes an error, not a fabricated successful completion.
 
-| Endpoint | Method | Description |
+Normal OpenAI clients receive finalized answer/reasoning text after buffering because upstream text can be replaced. The built-in UI supports provisional output and replacements. No fixed first-token latency is promised. Token usage is not measured.
+
+| Endpoint | Method | Purpose |
 |---|---|---|
-| `/v1/chat/completions` | POST | Chat completions (core) |
-| `/v1/models` | GET | List available models |
-| `/health` | GET | Health check (account pool status, uptime) |
-| `/` | GET | Built-in Web UI |
+| `/v1/chat/completions` | POST | Text completions and function-call adaptation |
+| `/v1/models` | GET | Registry model IDs; authentication required |
+| `/v1/conversations/{id}` | DELETE | Local SQLite history only |
+| `/health` | GET | Pool availability and uptime |
+| `/` | GET | Built-in UI |
 
----
+## Model registry
 
-## Web UI
+Current IDs: `claude-sonnet4.6`, `claude-sonnet5`, `claude-opus4.6`, `claude-opus4.7`, `claude-opus4.8`, `gpt-5.2`, `gpt-5.4`, `gpt-5.5`, `gemini-2.5flash`, `gemini-3.1pro`, `kimi-2.6`, `grok-4.3`, `grok-build0.1`, `deepseek-v4pro`.
 
-Access `http://localhost:8000` for the built-in **Notion AI Studio** interface:
+Availability and labels depend on the upstream; this list does not attest to vendor capabilities. Existing aliases including `gpt-4o`, `gpt-4.1`, and `claude-sonnet-4` map to `claude-sonnet4.6`. Unknown IDs are rejected rather than silently remapped.
 
-- **Conversation Management** — Create, rename, delete, star/bookmark
-- **Model Selector** — Grouped by provider (Anthropic / OpenAI / Google / Moonshot / xAI / DeepSeek)
-- **Thinking Panel** — Collapsible reasoning display with elapsed timer
-- **Search Panel** — Collapsible web search queries and source links
-- **Ambient Animations** — Weather effects: default / snow / rain / sunny / night
-- **Theme** — Light / dark mode toggle
-- **Responsive** — Mobile-friendly sidebar
+## Operational notes
 
-> Thinking and Search panels require `standard` or `heavy` mode.
+- Authenticated clients share one configured account pool and history store. This is **not tenant isolation**. A read-only upstream flag is not a substitute for actual account permissions.
+- Respect `Retry-After` on 429. Refresh expired credentials locally; 401/403 accounts are disabled in the current process until configuration/restart.
+- Browser keys are session-only; corrupt chat storage is preserved, not overwritten. Persistence failures produce a warning.
+- Deleting local conversations does not confirm deletion of Notion threads or backups.
+- Docker health checks mark containers unhealthy; `restart: always` does not by itself restart a still-running unhealthy process.
+- Reverse proxies must disable response buffering, allow sufficient upstream timeouts, and configure trusted forwarding addresses deliberately.
 
----
+See [.env.example](.env.example) for request limits, local CORS defaults, paths, and provider settings. The old `DISABLE_RATE_LIMIT` setting is not supported.
 
-## Environment Variables
-
-| Variable | Description | Default |
-|---|---|---|
-| `NOTION_ACCOUNTS` | Notion credentials JSON array | **Required** |
-| `APP_MODE` | `lite` / `standard` / `heavy` | `heavy` |
-| `API_KEY` | Bearer token for client auth | *(none)* |
-| `DB_PATH` | SQLite database path | `./data/conversations.db` |
-| `HOST` | Bind address | `0.0.0.0` |
-| `PORT` | Service port | `8000` |
-| `HOST_PORT` | Docker host port | `8000` |
-| `ALLOWED_ORIGINS` | CORS allowed origins | `*` |
-| `SILICONFLOW_API_KEY` | Required for Heavy mode compression | *(none)* |
-| `DISABLE_RATE_LIMIT` | Disable per-IP rate limiting | `false` |
-| `NOTION_CLIENT_VERSION` | Override Notion client version header | `23.13.20260228.0625` |
-| `LOG_LEVEL` | Logging level | `INFO` |
-| `TZ` | Timezone | `Asia/Shanghai` |
-
----
-
-## Docker Reference
+## Validation
 
 ```bash
-# Start
-docker-compose up -d
-
-# View logs
-docker-compose logs -f --tail=50
-
-# Restart (e.g. after updating accounts.json)
-docker-compose restart
-
-# Update code and redeploy
-git pull && docker-compose down && docker-compose build --no-cache && docker-compose up -d
-
-# Stop
-docker-compose down
+python -m compileall -q app main.py tests
+python -m unittest discover -s tests -v
+node --test tests/frontend.test.cjs
 ```
 
-### Nginx Reverse Proxy (optional)
+Python 3.11+ and Node 20+ are recommended. The suites use fake credentials and mocked transports. They are **not yet run on this branch**: connected GitHub workflow-file writes returned HTTP 404. No passing CI result is claimed. Provider variants, browser behavior, legacy migrations, and deployment dependencies require validation before merge; dependency bounds are not a lockfile or vulnerability audit.
 
-```nginx
-location / {
-    proxy_pass http://127.0.0.1:8000;
-    proxy_set_header Host $host;
-    proxy_buffering off;
-    proxy_cache off;
-    proxy_read_timeout 300s;
-}
-```
+## License and attribution
 
----
+MIT License. Original project: [maverickxone/notion2api](https://github.com/maverickxone/notion2api).
 
-## FAQ
-
-**Thinking panel not showing?**  
-Use `APP_MODE=standard` or `heavy`. Lite mode does not support Thinking or Search panels.
-
-**How do I switch modes?**  
-Edit `APP_MODE` in `.env`, then restart: `docker-compose restart`
-
-**How do I add multiple accounts?**  
-Edit `accounts.json` as an array — accounts are load-balanced automatically:
-```json
-[
-  {"token_v2": "token1", "space_id": "...", "user_id": "...", "space_view_id": "...", "user_name": "...", "user_email": "..."},
-  {"token_v2": "token2", "space_id": "...", "user_id": "...", "space_view_id": "...", "user_name": "...", "user_email": "..."}
-]
-```
-
-**Getting 429 or Notion AI suspended?**  
-Notion may throttle workspaces with unusual request patterns. Adding multiple accounts helps distribute load. Business Trial workspaces are especially prone to this.
-
-**Token expired?**  
-Re-run `python login.py` or repeat the F12 steps to refresh credentials.
-
----
-
-## Compatibility
-
-> Due to Notion's own AI latency, expect ~3 seconds from request to first token.
-
-| Client | Status | Notes |
-|---|---|---|
-| Cherry Studio | ✅ Full support | Recommended |
-| Zotero Translation | ✅ Full support | Slightly slow; sonnet model most accurate |
-| Immersive Translate | ⚠️ Not recommended | High latency |
-| Claude Code | ❌ Not supported | Uses Anthropic native API format |
-
----
-
-## License
-
-MIT License
-
----
-
-If this project helps you, please give it a Star ⭐
-
-*Built with assistance from Claude Code.*
+*The original project was built with assistance from Claude Code.*

@@ -1,41 +1,36 @@
-import logging
 import json
-import time
+import logging
+import os
 from datetime import datetime
 
-class JsonFormatter(logging.Formatter):
-    """自定义 JSON 格式化器"""
-    def format(self, record):
-        log_record = {
-            "timestamp": datetime.fromtimestamp(record.created).isoformat(),
-            "level": record.levelname,
-            "message": record.getMessage(),
-        }
-        
-        # 提取自定义 extra 字段
-        if hasattr(record, "request_info"):
-            log_record.update(record.request_info)
-            
-        # 如果有异常，记录 trace
-        if record.exc_info:
-            log_record["exception"] = self.formatException(record.exc_info)
-            
-        return json.dumps(log_record, ensure_ascii=False)
 
-def setup_logger(name="notion_opus"):
-    """配置并返回单例全局 logger"""
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        value = {'timestamp': datetime.fromtimestamp(record.created).isoformat(),
+                 'level': record.levelname, 'message': record.getMessage()}
+        # Explicit metadata allowlist: no prompts, tool arguments/results, bodies,
+        # cookies, upstream excerpts, or raw protocol lines in routine logs.
+        allowed = {'event', 'method', 'path', 'status_code', 'status', 'duration_ms', 'mode',
+                   'accounts', 'attempt', 'max_retries', 'retriable', 'exception_type',
+                   'message_count', 'row_count', 'summary_count', 'round_number',
+                   'content_length', 'thinking_length', 'wait_seconds', 'cooldown_seconds'}
+        info = getattr(record, 'request_info', {})
+        if isinstance(info, dict):
+            value.update({k: v for k, v in info.items() if k in allowed})
+        if record.exc_info:
+            value['exception_type'] = record.exc_info[0].__name__
+        return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def setup_logger(name='notion_opus'):
     logger = logging.getLogger(name)
-    
-    # 防止重复添加 handler
+    logger.setLevel(os.getenv('LOG_LEVEL', 'INFO').upper())
     if not logger.handlers:
-        logger.setLevel(logging.INFO)
-        
-        console_handler = logging.StreamHandler()
-        console_handler.setFormatter(JsonFormatter())
-        
-        logger.addHandler(console_handler)
-        
+        handler = logging.StreamHandler()
+        handler.setFormatter(JsonFormatter())
+        logger.addHandler(handler)
+    logger.propagate = False
     return logger
 
-# 全局单例 logger 实例
+
 logger = setup_logger()
